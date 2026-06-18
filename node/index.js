@@ -1,244 +1,342 @@
 const http = require('http');
-const net = require('net');
+const https = require('https');
 const fs = require('fs');
+const fsp = fs.promises;
 const path = require('path');
+const { spawn, exec, execSync } = require('child_process');
+const os = require('os');
 const crypto = require('crypto');
+const util = require('util');
 
-// ================= 配置区域 =================
-const PORT = parseInt(process.env.SERVER_PORT || process.env.PORT || 3100);
-const UUID = 'ad7cc28d-c16d-454e-88c9-29c5deb23f8c'; // 你的 UUID
-const WS_PATH = '/node'; // 你的路径
+const execAsync = util.promisify(exec);
 
-// WebSocket GUID 魔法字符串 (RFC 6455 标准固定值)
-const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+// ==============================================================================
+//  0. 核心配置聚合
+// ==============================================================================
+const CONFIG = {
+    PORT: parseInt(process.env.SERVER_PORT || process.env.PORT || 3000),
+    UUID: process.env.UUID || '',
+    LINK_NAME: process.env.LINK_NAME || 'Node',
+    CDN_HOST: process.env.CDN_HOST || 'www.visa.com.sg',
+    SERVER_IP: process.env.SERVER_IP || '127.0.0.1',
+    
+    // Xray 配置
+    XRAY_URL: 'https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip',
+    PROTOCOL: process.env.XRAY_PROTOCOL || 'xhttp',
+    ENABLE_XRAY: process.env.ENABLE_XRAY !== 'false',
+    ENABLE_PQ: process.env.ENABLE_PQ !== 'false',
+    
+    CUSTOM_DOMAIN: process.env.CUSTOM_DOMAIN || '', 
+    PERSIST_FILE: path.join(__dirname, '.sys_data') 
+};
 
-// ================= HTTP 服务 (伪装站) =================
-const server = http.createServer((req, res) => {
-    if (req.url === '/' || req.url === '/index.html') {
-        const htmlPath = path.join(__dirname, 'index.html');
-        // 如果没有 html 文件，直接返回一段文本
-        if (fs.existsSync(htmlPath)) {
-            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-            fs.createReadStream(htmlPath).pipe(res);
-        } else {
-            res.writeHead(200);
-            res.end('<h1>Welcome to Native Node Server</h1>');
-        }
-    } else {
-        res.writeHead(404);
-        res.end('Not Found');
+CONFIG.FLOW = CONFIG.ENABLE_PQ ? 'xtls-rprx-vision' : '';
+
+// 辅助函数：检查文件/文件夹是否存在（异步）
+const existsAsync = async (p) => {
+    try {
+        await fsp.access(p);
+        return true;
+    } catch {
+        return false;
     }
+};
+
+// ==============================================================================
+//  1. 状态持久化管理 (异步版)
+// ==============================================================================
+const StateManager = {
+    data: {},
+    async load() {
+        if (await existsAsync(CONFIG.PERSIST_FILE)) {
+            try {
+                const content = await fsp.readFile(CONFIG.PERSIST_FILE, 'utf-8');
+                this.data = JSON.parse(content);
+            } catch (e) { this.data = {}; }
+        }
+        return this.data;
+    },
+    async save(fields) {
+        try {
+            this.data = { ...this.data, ...fields };
+            const tmpFile = CONFIG.PERSIST_FILE + '.tmp';
+            await fsp.writeFile(tmpFile, JSON.stringify(this.data));
+            await fsp.rename(tmpFile, CONFIG.PERSIST_FILE);
+        } catch (e) {}
+    }
+};
+
+// ==============================================================================
+//  2. 动态环境与工具函数
+// ==============================================================================
+const getMemLimitAsync = async () => {
+    try {
+        const paths = ['/sys/fs/cgroup/memory.max', '/sys/fs/cgroup/memory/memory.limit_in_bytes'];
+        for (const p of paths) {
+            if (await existsAsync(p)) {
+                const content = await fsp.readFile(p, 'utf8');
+                const limit = parseInt(content);
+                return (limit > 0 && limit < 9e15) ? limit : os.totalmem();
+            }
+        }
+    } catch (e) {}
+    return os.totalmem();
+};
+
+const randomStr = () => crypto.randomBytes(4).toString('hex');
+const TMP = path.join(__dirname, 'tmp');
+
+const FILES = {
+    BIN: path.join(TMP, `${randomStr()}`),
+    ZIP: path.join(TMP, `${randomStr()}.zip`),
+    CFG: path.join(TMP, 'config.json'),
+    LINKS: path.join(__dirname, 'LINK.txt')
+};
+
+const download = (url, dest) => new Promise((resolve, reject) => {
+    const options = { headers: { 'User-Agent': 'Mozilla/5.0 (Compatible; Node.js)' } };
+    const get = url.startsWith('https') ? https.get : http.get;
+    get(url, options, res => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+            return download(res.headers.location, dest).then(resolve).catch(reject);
+        }
+        if (res.statusCode !== 200) return reject(`Status ${res.statusCode}`);
+        const file = fs.createWriteStream(dest);
+        res.pipe(file);
+        file.on('finish', () => file.close(resolve));
+    }).on('error', reject).setTimeout(30000, () => reject('Timeout'));
 });
 
-// ================= WebSocket 协议升级与处理 =================
-server.on('upgrade', (req, socket, head) => {
-    // 1. 检查路径
-    const pathname = new URL(req.url, `http://${req.headers.host}`).pathname;
-    if (pathname !== WS_PATH) {
-        socket.destroy();
-        return;
+// ==============================================================================
+//  2.5 获取 Cloudflare Warp WireGuard 私钥的异步函数
+// ==============================================================================
+const getWgcfKeyAsync = () => new Promise((resolve) => {
+    const wgcfTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wgcf-'));
+    const wgcfPath = path.join(wgcfTmpDir, 'wgcf');
+    const wgcfUrl = 'https://github.com/ViRb3/wgcf/releases/download/v2.2.31/wgcf_2.2.31_linux_amd64';
+
+    download(wgcfUrl, wgcfPath).then(() => {
+        try {
+            fs.chmodSync(wgcfPath, '755');
+            execSync('./wgcf register --accept-tos', { cwd: wgcfTmpDir, stdio: 'ignore' });
+            execSync('./wgcf generate', { cwd: wgcfTmpDir, stdio: 'ignore' });
+
+            const conf = fs.readFileSync(path.join(wgcfTmpDir, 'wgcf-profile.conf'), 'utf8');
+            const wgkey = conf.match(/PrivateKey\s*=\s*([^\s]+)/)?.[1] || '';
+            resolve(wgkey);
+        } catch (e) {
+            resolve('');
+        } finally {
+            fs.rmSync(wgcfTmpDir, { recursive: true, force: true });
+        }
+    }).catch(() => resolve(''));
+});
+
+
+// ==============================================================================
+//  3. 核心业务与执行主流程 (全面异步)
+// ==============================================================================
+(async () => {
+    // 1. 清除旧的固定链接文件
+    if (await existsAsync(FILES.LINKS)) {
+        await fsp.unlink(FILES.LINKS).catch(() => {});
     }
 
-    // 2. WebSocket 握手 (Handshake)
-    const key = req.headers['sec-websocket-key'];
-    const acceptKey = crypto.createHash('sha1')
-        .update(key + WS_GUID)
-        .digest('base64');
+    // 2. 准备系统内存限制与临时目录
+    const memLimit = await getMemLimitAsync();
+    const RUN_ENV = { ...process.env, GOMEMLIMIT: Math.floor(memLimit * 0.85) + 'B' };
 
-    const responseHeaders = [
-        'HTTP/1.1 101 Switching Protocols',
-        'Upgrade: websocket',
-        'Connection: Upgrade',
-        `Sec-WebSocket-Accept: ${acceptKey}`,
-        '\r\n'
-    ];
-    socket.write(responseHeaders.join('\r\n'));
+    if (await existsAsync(TMP)) await fsp.rm(TMP, { recursive: true, force: true }).catch(()=>{});
+    await fsp.mkdir(TMP, { recursive: true });
 
-    // 3. 处理 WebSocket 数据流
-    // 我们需要一个状态机来处理 TCP 数据包（可能粘包或分包）
-    let buffer = Buffer.alloc(0);
-    let remoteSocket = null;
-    let isVlessHeaderParsed = false;
-
-    socket.on('data', (chunk) => {
-        // 将新数据追加到缓存
-        buffer = Buffer.concat([buffer, chunk]);
-
-        // 循环处理缓存中的帧
-        while (buffer.length > 0) {
-            const frame = decodeWSFrame(buffer);
-            if (!frame) break; // 数据不够，等待下一个 chunk
-
-            // 从缓存中移除已处理的帧
-            buffer = buffer.slice(frame.frameLength);
-
-            // 处理 Payload (Opcode 1=Text, 2=Binary, 8=Close)
-            if (frame.opcode === 0x8) {
-                socket.end(); // 收到关闭帧
-                if (remoteSocket) remoteSocket.end();
-                return;
-            }
-
-            // VLESS 逻辑处理 (数据在 frame.payload 中)
-            if (!isVlessHeaderParsed) {
-                // --- VLESS 头部解析 ---
-                const msg = frame.payload;
-                if (msg.length < 17) return; // 长度不够
-
-                // 校验 UUID
-                const clientUuid = parseUuid(msg.slice(1, 17));
-                if (clientUuid !== UUID) {
-                    socket.end();
-                    return;
-                }
-
-                // 解析目标地址
-                let cursor = 17;
-                const addonsLen = msg[cursor];
-                cursor += 1 + addonsLen;
-                
-                const command = msg[cursor]; // 1=TCP
-                cursor++;
-                const remotePort = msg.readUInt16BE(cursor);
-                cursor += 2;
-                const addrType = msg[cursor];
-                cursor++;
-
-                let remoteAddr = '';
-                if (addrType === 1) { // IPv4
-                    remoteAddr = msg.slice(cursor, cursor + 4).join('.');
-                    cursor += 4;
-                } else if (addrType === 2) { // Domain
-                    const domainLen = msg[cursor];
-                    cursor++;
-                    remoteAddr = msg.slice(cursor, cursor + domainLen).toString();
-                    cursor += domainLen;
-                } else if (addrType === 3) { // IPv6
-                    remoteAddr = msg.slice(cursor, cursor + 16).toString('hex').match(/.{1,4}/g).join(':');
-                    cursor += 16;
-                }
-
-                // 连接目标
-                remoteSocket = net.createConnection(remotePort, remoteAddr, () => {
-                    // 连接成功，回复 VLESS 响应头部 0x00 0x00
-                    // 注意：必须封装在 WebSocket 帧中发回给客户端
-                    const vlessRes = Buffer.from([0, 0]);
-                    const wsFrame = encodeWSFrame(vlessRes);
-                    socket.write(wsFrame);
-
-                    // 如果握手包还有剩余数据(payload)，转发给目标
-                    if (cursor < msg.length) {
-                        remoteSocket.write(msg.slice(cursor));
-                    }
-                });
-
-                remoteSocket.on('data', (data) => {
-                    // 收到目标网站数据 -> 封装成 WS 帧 -> 发给客户端
-                    const wsFrame = encodeWSFrame(data);
-                    socket.write(wsFrame);
-                });
-
-                remoteSocket.on('error', () => socket.end());
-                remoteSocket.on('end', () => socket.end());
-
-                isVlessHeaderParsed = true;
+    try {
+        // 加载持久化状态
+        const state = await StateManager.load();
+        
+        // 🌟 【新增逻辑】优先读取持久化的 Warp 密钥，没有则在线获取并保存
+        let wgkey = state.wgkey || '';
+        if (!wgkey) {
+            console.log('⏳');
+            wgkey = await getWgcfKeyAsync();
+            if (wgkey) {
+                await StateManager.save({ wgkey });
+                console.log('🔑');
             } else {
-                // --- 已建立连接，直接解包转发 ---
-                if (remoteSocket && !remoteSocket.destroyed) {
-                    remoteSocket.write(frame.payload);
-                }
+                console.log('⚠️');
             }
         }
-    });
 
-    socket.on('error', () => { if (remoteSocket) remoteSocket.destroy(); });
-    socket.on('end', () => { if (remoteSocket) remoteSocket.destroy(); });
-});
+        const uuid = CONFIG.UUID || state.uuid || crypto.randomUUID();
+        if (uuid !== state.uuid) await StateManager.save({ uuid });
 
-// ================= 辅助函数：解码 WebSocket 帧 =================
-function decodeWSFrame(data) {
-    if (data.length < 2) return null;
-
-    // 解析头部
-    // byte 0: FIN(1) RSV(3) Opcode(4)
-    const opcode = data[0] & 0x0f;
-    // byte 1: Mask(1) PayloadLen(7)
-    const masked = (data[1] >> 7) === 1;
-    let payloadLen = data[1] & 0x7f;
-    let offset = 2;
-
-    // 解析扩展长度
-    if (payloadLen === 126) {
-        if (data.length < 4) return null;
-        payloadLen = data.readUInt16BE(2);
-        offset += 2;
-    } else if (payloadLen === 127) {
-        if (data.length < 10) return null;
-        // JS 整数最大安全值 2^53，这里简化处理，只读后32位（通常够用）
-        payloadLen = data.readUInt32BE(6); 
-        offset += 8;
-    }
-
-    // 解析 Mask Key
-    let maskKey = null;
-    if (masked) {
-        if (data.length < offset + 4) return null;
-        maskKey = data.slice(offset, offset + 4);
-        offset += 4;
-    }
-
-    // 检查数据是否完整
-    if (data.length < offset + payloadLen) return null;
-
-    // 提取 Payload 并解码 (XOR)
-    const payload = data.slice(offset, offset + payloadLen);
-    if (masked) {
-        for (let i = 0; i < payload.length; i++) {
-            payload[i] ^= maskKey[i % 4];
+        const PATH_CONFIG = {
+            ws: process.env.WS_PATH || state.ws || '/' + randomStr(),
+            xhttp: process.env.XHTTP_PATH || state.xhttp || '/' + randomStr()
+        };
+        if (PATH_CONFIG.ws !== state.ws || PATH_CONFIG.xhttp !== state.xhttp) {
+            await StateManager.save({ ws: PATH_CONFIG.ws, xhttp: PATH_CONFIG.xhttp });
         }
+
+        let keys = state.keys || { decryption: process.env.VLESS_DECRYPTION || '', encryption: process.env.VLESS_ENCRYPTION || '' };
+
+        // 辅助：生成链接
+        const genVlessLink = (host, port, remarks, isDomainLink) => {
+            const isXhttp = CONFIG.PROTOCOL === 'xhttp';
+            const pathVal = isXhttp ? PATH_CONFIG.xhttp : PATH_CONFIG.ws;
+            const netType = isXhttp ? 'xhttp' : 'ws';
+            
+            const link = new URL(`vless://${uuid}@${isDomainLink ? CONFIG.CDN_HOST : host}:${isDomainLink ? 443 : port}`);
+            const params = link.searchParams;
+            params.set('security', 'tls');
+            if (CONFIG.ENABLE_PQ && keys.encryption) params.set('encryption', keys.encryption);
+            if (CONFIG.FLOW) params.set('flow', CONFIG.FLOW);
+            
+            if (isDomainLink) { 
+                params.set('sni', host); 
+            } else { 
+                params.set('sni', CONFIG.CDN_HOST); 
+                params.set('insecure', '1'); 
+            }
+            
+            params.set('fp', 'firefox'); 
+            params.set('alpn', 'h2'); 
+            params.set('type', netType); 
+            params.set('path', pathVal);
+            link.hash = remarks;
+            return link.toString();
+        };
+
+        // 辅助：异步保存链接内容
+        const saveLink = async (content, title = '') => {
+            try { await fsp.appendFile(FILES.LINKS, `\n${title}\n${content}\n`, 'utf-8'); } catch(e) {}
+        };
+
+        // 4. Xray 核心流程
+        if (CONFIG.ENABLE_XRAY) {
+            await download(CONFIG.XRAY_URL, FILES.ZIP);
+            await execAsync(`unzip -o ${FILES.ZIP} -d ${TMP}`);
+            
+            const { stdout: findOut } = await execAsync(`find ${TMP} -type f -name "xray" | head -n 1`);
+            const xrayPath = findOut.toString().trim();
+            await fsp.rename(xrayPath, FILES.BIN); 
+            await fsp.chmod(FILES.BIN, 0o755);
+
+            // 5. 证书生成与调用
+            let certArray = [], keyArray = [];
+            if (state.cert && state.key) {
+                certArray = state.cert.split('\n');
+                keyArray = state.key.split('\n');
+            } else {
+                try { 
+                    const { stdout: certOut } = await execAsync(`${FILES.BIN} tls cert`, { encoding: 'utf-8' }); 
+                    const certData = JSON.parse(certOut); 
+                    certArray = certData.certificate;
+                    keyArray = certData.key;
+                    await StateManager.save({ cert: certArray.join('\n'), key: keyArray.join('\n') });
+                } catch (e) {}
+            }
+
+            // 6. PQ 密钥
+            if (CONFIG.ENABLE_PQ && (!keys.decryption || !keys.encryption)) {
+                try {
+                    const { stdout: cmdOut } = await execAsync(`${FILES.BIN} vlessenc`, { encoding: 'utf-8' });
+                    const match = cmdOut.match(/ML-KEM-768[\s\S]+?"decryption":\s*"([^"]+)"[\s\S]+?"encryption":\s*"([^"]+)"/);
+                    if (match) { 
+                        keys = { decryption: match[1], encryption: match[2] }; 
+                        await StateManager.save({ keys }); 
+                    }
+                } catch (e) {}
+            }
+
+            const stream = CONFIG.PROTOCOL === 'xhttp' ? 
+                { sockopt: {tcpcongestion: "bbr"},network: "xhttp", security: "tls", tlsSettings: { minVersion: "1.3",certificates: [{ certificate: certArray, key: keyArray }] }, xhttpSettings: { path: PATH_CONFIG.xhttp } } : 
+                { sockopt: {tcpcongestion: "bbr"},network: "ws", security: "tls", tlsSettings: { minVersion: "1.3",certificates: [{ certificate: certArray, key: keyArray }] }, wsSettings: { path: PATH_CONFIG.ws } };
+
+            // 7. 动态构建出站 (Outbounds) 和路由规则 (Routing)
+            const outbounds = [];
+            const routingRules = [];
+
+           // 基础出站（直连和阻止）
+            outbounds.push(
+                { 
+                    protocol: 'freedom', 
+                    tag: 'direct', 
+                    streamSettings: { 
+                        finalmask: { tcp: [{ type: "fragment", settings: { "packets": "tlshello", "length": "100-200", "delay": "10-20", "maxSplit": "3-6" } }] },
+                        sockopt: { tcpcongestion: 'bbr', domainStrategy: 'UseIP', happyEyeballs: { tryDelayMs: 250 } } 
+                    }  
+                }, 
+                { protocol: 'blackhole', tag: 'block' }
+            );
+
+            // 🌟 如果成功获取到 wgkey，则特定域名走 Warp
+            if (wgkey) {
+              outbounds.push({
+                protocol: "wireguard",
+                tag: "warp",
+                settings: {
+                  secretKey: wgkey,
+                  "address": ["172.16.0.2/32"],
+                  peers: [{
+                      endpoint: "162.159.192.1:2408",
+                      publicKey: "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+                    }
+                  ]
+                }
+              });
+                
+            // 特定域名走 Warp
+            routingRules.push({
+              outboundTag: "warp",
+              domain: ["google.com"]
+            },{
+              outboundTag: "direct",
+              network: "tcp,udp"
+            });
+          }
+
+            // 写入配置文件
+            await fsp.writeFile(FILES.CFG, JSON.stringify({
+                log: { loglevel: 'none' },
+                inbounds: [{ 
+                    port: CONFIG.PORT, 
+                    protocol: 'vless', 
+                    settings: { 
+                        clients: [{ id: uuid, flow: CONFIG.FLOW }], 
+                        decryption: (CONFIG.ENABLE_PQ && keys.decryption) ? keys.decryption : "none" 
+                    }, 
+                    streamSettings: stream 
+                }],
+                dns: { servers: ["https+local://1.1.1.1/dns-query", "localhost"] },
+                outbounds: outbounds,
+                routing: { domainStrategy: "AsIs", rules: routingRules }
+            }));
+            
+            // 守护进程拉起
+            const child = spawn(FILES.BIN, ['-c', FILES.CFG], { stdio: 'ignore', env: RUN_ENV });
+            child.on('exit', () => process.exit(1));
+
+            // 8. 生成并保存链接
+            if (CONFIG.SERVER_IP) {
+                await saveLink(genVlessLink(CONFIG.SERVER_IP, CONFIG.PORT, `${CONFIG.LINK_NAME}-Direct`, false), 'Direct IP');
+            }
+            if (CONFIG.CUSTOM_DOMAIN) {
+                await saveLink(genVlessLink(CONFIG.CUSTOM_DOMAIN, 443, `${CONFIG.LINK_NAME}`, true), 'Custom Domain');
+            }
+        }
+
+        console.log('✅ Initialized Async Mode');
+    } catch (e) { 
+        console.error(e);
+        process.exit(1); 
     }
 
-    return {
-        opcode,
-        payload,
-        frameLength: offset + payloadLen
-    };
-}
-
-// ================= 辅助函数：封装 WebSocket 帧 =================
-function encodeWSFrame(data) {
-    // 服务器发给客户端：FIN=1, Opcode=2(Binary), Mask=0
-    let header;
-    const len = data.length;
-
-    if (len <= 125) {
-        header = Buffer.from([0x82, len]);
-    } else if (len <= 65535) {
-        header = Buffer.alloc(4);
-        header[0] = 0x82;
-        header[1] = 126;
-        header.writeUInt16BE(len, 2);
-    } else {
-        header = Buffer.alloc(10);
-        header[0] = 0x82;
-        header[1] = 127;
-        // 简化：假设长度不超过 32位整数
-        header.writeUInt32BE(0, 2);
-        header.writeUInt32BE(len, 6);
-    }
-
-    return Buffer.concat([header, data]);
-}
-
-// ================= 辅助函数：UUID 转换 =================
-function parseUuid(buffer) {
-    const hex = buffer.toString('hex');
-    return `${hex.substr(0, 8)}-${hex.substr(8, 4)}-${hex.substr(12, 4)}-${hex.substr(16, 4)}-${hex.substr(20)}`;
-}
-
-// 启动
-server.listen(PORT, () => {
-    console.log(`Native Node VLESS Server running on port ${PORT}`);
-    console.log(`Path: ${WS_PATH}`);
-    console.log(`UUID: ${UUID}`);
-});
+    // 延迟清理临时文件 (TMP 文件夹)
+    setTimeout(async () => { 
+        if (await existsAsync(TMP)) {
+            try { await fsp.rm(TMP, { recursive: true, force: true }); } catch(e) {}
+        }
+    }, 20000);
+    
+    setInterval(() => console.log('💓 Heartbeat', new Date().toISOString()), 3600000);
+})();
